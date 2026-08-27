@@ -1,4 +1,4 @@
-"""RAISE-India: Regime-Adaptive Indian Sector Equity strategy engine.
+"""RAISE-India v2: Regime-Aware Core-Satellite Equity strategy engine.
 
 The module is deliberately reusable by both Google Colab and Streamlit.
 Signals are formed at a weekly close and applied from the next trading day.
@@ -67,10 +67,18 @@ class StrategyConfig:
     max_per_sector: int = 2
     max_stock_weight: float = 0.15
     max_sector_weight: float = 0.25
-    target_volatility: float = 0.12
+    # V2 deliberately targets an equity-like risk level. The original 12%
+    # target combined with regime caps made the strategy chronically defensive.
+    target_volatility: float = 0.18
     trend_exposure: float = 1.00
-    sideways_exposure: float = 0.70
-    stress_exposure: float = 0.30
+    sideways_exposure: float = 0.95
+    stress_exposure: float = 0.60
+    # A persistent risk-adjusted-momentum core prevents every regime change
+    # from replacing the entire economic hypothesis.
+    momentum_core_weight: float = 0.65
+    # Blend equal and inverse-volatility allocation among the selected stocks.
+    # This avoids concentrating exclusively in the lowest-volatility names.
+    equal_weight_blend: float = 0.50
     train_end: str = "2019-12-31"
     validation_end: str = "2022-12-31"
     random_state: int = 42
@@ -162,14 +170,19 @@ def stock_features(prices: pd.DataFrame, volume: pd.DataFrame) -> Dict[str, pd.D
     std20 = prices.rolling(20).std()
     sma200 = prices.rolling(200).mean()
     returns = prices.pct_change(fill_method=None)
+    vol126 = returns.rolling(126).std() * np.sqrt(TRADING_DAYS)
+    vol252 = returns.rolling(252).std() * np.sqrt(TRADING_DAYS)
     return {
         "ret63": prices.pct_change(63, fill_method=None),
         "ret126": prices.pct_change(126, fill_method=None),
+        "ret252": prices.pct_change(252, fill_method=None),
         "trend200": prices / sma200 - 1,
         "z20": (prices - sma20) / std20.replace(0, np.nan),
         "rsi14": _rsi(prices, 14),
         "volume_ratio": volume / volume.rolling(20).mean().replace(0, np.nan),
         "vol20": returns.rolling(20).std() * np.sqrt(TRADING_DAYS),
+        "vol126": vol126,
+        "vol252": vol252,
     }
 
 
@@ -355,31 +368,51 @@ def _portfolio_weights_for_date(
 ) -> Tuple[pd.Series, pd.Series]:
     tickers = returns.columns
     f = {name: frame.loc[date].reindex(tickers) for name, frame in features.items()}
-    trend_score = (
-        0.40 * _rank(f["ret126"])
-        + 0.30 * _rank(f["ret63"])
+    # The persistent core mirrors the economic logic of NSE's momentum
+    # methodology: combine six- and twelve-month returns after volatility
+    # adjustment. Percentile ranks keep the two horizons comparable.
+    momentum_6m = f["ret126"] / f["vol126"].replace(0, np.nan)
+    momentum_12m = f["ret252"] / f["vol252"].replace(0, np.nan)
+    momentum_core = 0.50 * _rank(momentum_6m) + 0.50 * _rank(momentum_12m)
+
+    trend_tilt = (
+        0.45 * _rank(f["ret126"])
+        + 0.25 * _rank(f["ret63"])
         + 0.20 * _rank(f["trend200"])
         + 0.10 * _rank(f["volume_ratio"])
     )
-    mean_reversion_score = (
-        0.45 * _rank(-f["z20"])
-        + 0.25 * _rank(50 - f["rsi14"])
-        + 0.30 * _rank(f["ret126"])
+    # Mean reversion is now only a mild tilt. In V1 it replaced momentum in
+    # sideways regimes and repeatedly selected weak stocks.
+    sideways_tilt = (
+        0.45 * _rank(f["ret126"])
+        + 0.25 * _rank(f["trend200"])
+        + 0.20 * _rank(-f["z20"])
+        + 0.10 * _rank(50 - f["rsi14"])
     )
-    defensive_score = 0.60 * _rank(f["ret126"]) + 0.40 * _rank(f["trend200"])
+    defensive_tilt = (
+        0.45 * _rank(momentum_6m)
+        + 0.30 * _rank(f["trend200"])
+        + 0.25 * _rank(-f["vol20"])
+    )
 
     if regime == "Trend":
-        score = trend_score
-        eligible = (f["ret63"] > 0) & (f["trend200"] > 0)
+        regime_tilt = trend_tilt
         exposure_cap = config.trend_exposure
     elif regime == "Stress":
-        score = defensive_score
-        eligible = (f["ret126"] > 0) & (f["trend200"] > 0)
+        regime_tilt = defensive_tilt
         exposure_cap = config.stress_exposure
     else:
-        score = mean_reversion_score
-        eligible = (f["z20"] < 0.50) & (f["rsi14"] < 60) & (f["ret126"] > -0.05)
+        regime_tilt = sideways_tilt
         exposure_cap = config.sideways_exposure
+
+    score = (
+        config.momentum_core_weight * momentum_core
+        + (1.0 - config.momentum_core_weight) * regime_tilt
+    )
+    # V2 ranks all stocks with valid medium- and long-term observations. Risk
+    # is controlled through exposure, volatility and caps instead of brittle
+    # eligibility rules that can unintentionally force the portfolio to cash.
+    eligible = f["ret126"].notna() & f["ret252"].notna() & f["vol126"].gt(0)
 
     selected = _select_with_sector_limit(
         score, eligible, sectors, config.max_positions, config.max_per_sector
@@ -389,8 +422,14 @@ def _portfolio_weights_for_date(
         return result, score
 
     inverse_vol = 1.0 / f["vol20"].reindex(selected).clip(lower=0.05)
+    inverse_vol = inverse_vol / inverse_vol.sum()
+    equal_weight = pd.Series(1.0 / len(selected), index=selected)
+    raw_allocation = (
+        config.equal_weight_blend * equal_weight
+        + (1.0 - config.equal_weight_blend) * inverse_vol
+    )
     bounded = _bounded_weights(
-        inverse_vol,
+        raw_allocation,
         sectors,
         config.max_stock_weight,
         config.max_sector_weight,
@@ -410,13 +449,22 @@ def _simple_momentum_weights(
     max_positions: int = 10,
 ) -> pd.DataFrame:
     momentum = prices.pct_change(126, fill_method=None)
-    weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    rebalance_rows: Dict[pd.Timestamp, pd.Series] = {}
     for date in rebalances:
         top = momentum.loc[date].dropna().nlargest(max_positions).index
         positive = [t for t in top if momentum.loc[date, t] > 0]
+        row = pd.Series(0.0, index=prices.columns)
         if positive:
-            weights.loc[date, positive] = 1.0 / len(positive)
-    return weights.replace(0, np.nan).ffill().fillna(0.0)
+            row.loc[positive] = 1.0 / len(positive)
+        rebalance_rows[date] = row
+    if not rebalance_rows:
+        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    # Preserve genuine zero weights. Replacing zeros with NaN caused sold
+    # positions to be forward-filled indefinitely in V1, overstating the
+    # momentum benchmark's exposure and return.
+    decisions = pd.DataFrame.from_dict(rebalance_rows, orient="index")
+    decisions = decisions.reindex(columns=prices.columns).sort_index().fillna(0.0)
+    return decisions.reindex(prices.index).ffill().fillna(0.0)
 
 
 def _metrics(returns: pd.Series, initial_capital: float = 1.0) -> Dict[str, float]:

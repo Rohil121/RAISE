@@ -1,4 +1,4 @@
-"""Streamlit dashboard for RAISE-India."""
+"""Streamlit dashboard for RAISE-India v2."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from strategy_engine import (
 
 
 st.set_page_config(page_title="RAISE-India", page_icon="📈", layout="wide")
-st.title("RAISE-India")
-st.caption("Regime-Adaptive Indian Sector Equity Strategy | Academic research dashboard")
+st.title("RAISE-India v2")
+st.caption("Regime-Aware Core-Satellite Indian Equity Strategy | Academic research dashboard")
 
 with st.sidebar:
     st.header("Backtest settings")
@@ -31,7 +31,7 @@ with st.sidebar:
     end = st.date_input("End date", value=pd.Timestamp.today().normalize())
     initial_capital = st.number_input("Starting capital (₹)", 100_000, 100_000_000, 1_000_000, 100_000)
     cost_bps = st.slider("One-way trading cost (bps)", 0, 50, 15)
-    target_vol = st.slider("Target annual volatility", 5, 25, 12) / 100
+    target_vol = st.slider("Target annual volatility", 5, 25, 18) / 100
     max_positions = st.slider("Maximum positions", 5, 15, 10)
     run = st.button("Run backtest", type="primary", use_container_width=True)
     st.info("Signals formed at the weekly close are applied one trading day later.")
@@ -54,8 +54,10 @@ if not run:
 
         1. A Gaussian Mixture Model classifies the NIFTY environment using momentum, volatility, drawdown and trend.
         2. Transparent trend/volatility rules confirm or override ambiguous ML classifications.
-        3. Momentum drives trending regimes; controlled mean reversion drives sideways regimes; stress regimes sharply reduce exposure.
-        4. Inverse-volatility weights, stock caps, sector caps and a volatility target control portfolio risk.
+        3. A persistent six- and twelve-month risk-adjusted-momentum core is retained in every regime.
+        4. Regime-specific trend, mild mean-reversion and defensive tilts adjust rankings without replacing the core.
+        5. Exposure remains equity-like at 100% / 95% / 60% for Trend / Sideways / Stress, before volatility scaling.
+        6. Equal-plus-inverse-volatility weights, stock caps and sector caps control concentration.
         """
     )
     st.stop()
@@ -92,13 +94,22 @@ daily = result["daily"]
 metrics = result["metrics"]
 test_metrics = metrics.query("Period == 'Test'").set_index("Strategy")
 strategy_metrics = test_metrics.loc["RAISE-India"] if "RAISE-India" in test_metrics.index else metrics.iloc[0]
+nifty_metrics = test_metrics.loc["NIFTY 50"] if "NIFTY 50" in test_metrics.index else None
 
 st.success(data_label)
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Test CAGR", f"{strategy_metrics['CAGR']:.2%}")
-c2.metric("Test Sharpe", f"{strategy_metrics['Sharpe']:.2f}")
-c3.metric("Max drawdown", f"{strategy_metrics['Max Drawdown']:.2%}")
+cagr_delta = strategy_metrics["CAGR"] - nifty_metrics["CAGR"] if nifty_metrics is not None else None
+sharpe_delta = strategy_metrics["Sharpe"] - nifty_metrics["Sharpe"] if nifty_metrics is not None else None
+drawdown_delta = strategy_metrics["Max Drawdown"] - nifty_metrics["Max Drawdown"] if nifty_metrics is not None else None
+c1.metric("Test CAGR", f"{strategy_metrics['CAGR']:.2%}", f"{cagr_delta:+.2%} vs NIFTY" if cagr_delta is not None else None)
+c2.metric("Test Sharpe", f"{strategy_metrics['Sharpe']:.2f}", f"{sharpe_delta:+.2f} vs NIFTY" if sharpe_delta is not None else None)
+c3.metric("Max drawdown", f"{strategy_metrics['Max Drawdown']:.2%}", f"{drawdown_delta:+.2%} vs NIFTY" if drawdown_delta is not None else None)
 c4.metric("Ending value", f"₹{strategy_metrics['Final Value']:,.0f}")
+
+if nifty_metrics is not None and strategy_metrics["CAGR"] > nifty_metrics["CAGR"]:
+    st.success("RAISE-India v2 beat NIFTY 50 on test-period CAGR. Check Sharpe and drawdown before concluding that it dominated on risk-adjusted performance.")
+elif nifty_metrics is not None:
+    st.warning("RAISE-India v2 did not beat NIFTY 50 on test-period CAGR. Treat this as evidence, not a result to hide or tune away.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["Performance", "Regimes", "Portfolio", "Stress test", "Downloads"]
@@ -179,6 +190,9 @@ with tab5:
         "sector_weights.csv": result["sector_weights"],
         "rebalance_holdings.csv": result["holdings"],
         "monte_carlo_summary.csv": result["stress_summary"],
+        "market_prices.csv": prices,
+        "market_volume.csv": volume,
+        "benchmark_prices.csv": benchmark.rename("NIFTY 50").to_frame(),
     }
     for name, frame in downloadable.items():
         st.download_button(name, csv_bytes(frame, index=not isinstance(frame.index, pd.RangeIndex)), name, "text/csv")

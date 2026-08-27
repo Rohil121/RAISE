@@ -1,6 +1,6 @@
-# RAISE-India
+# RAISE-India v2
 
-RAISE-India is a Regime-Adaptive Indian Sector Equity strategy created for the Financial Markets Analytics project.
+RAISE-India v2 is a regime-aware core-satellite Indian equity strategy created for the Financial Markets Analytics project.
 
 ## Files
 
@@ -28,12 +28,15 @@ Upload and open `RAISE_India_Colab.ipynb`. Select **Runtime → Run all**. The n
 - 25 established NSE stocks across nine sectors.
 - Weekly signals with a one-trading-day execution lag.
 - Hybrid regime detector: expanding-window Gaussian Mixture Model plus transparent trend/volatility overrides.
-- Regime-specific momentum, mean-reversion, and defensive signals.
-- Inverse-volatility allocation with 15% stock caps, 25% sector caps, and a 12% portfolio volatility target.
+- Persistent six- and twelve-month risk-adjusted-momentum core, plus regime-specific trend, mild mean-reversion and defensive tilts.
+- Equal-plus-inverse-volatility allocation with 15% stock caps, 25% sector caps, and an 18% portfolio volatility target.
+- Exposure caps of 100% in Trend, 95% in Sideways and 60% in Stress before volatility scaling.
 - ₹10 lakh initial capital and 15 bps one-way implementation cost.
 - Training: 2015–2019; validation: 2020–2022; untouched test: 2023 onward.
 
 The offline demonstration mode exists only for code and user-interface testing. It must never be presented as real investment evidence.
+
+V2 was introduced after the original model proved too defensive. The simple-momentum benchmark was also corrected so a stock assigned a genuine zero weight remains sold instead of being unintentionally forward-filled. Do not repeatedly tune V2 against the 2023–2026 test results; treat the next run as a documented robustness check.
 
 ## Final submission checklist
 
